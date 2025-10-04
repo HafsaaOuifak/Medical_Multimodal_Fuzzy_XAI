@@ -1,0 +1,6 @@
+Model,Fold,Accuracy,Precision,Recall,F1_Score
+ResNet50,1,0.8,0.0,0.0,0.0
+ResNet50,2,0.8,0.0,0.0,0.0
+ResNet50,3,0.8,0.0,0.0,0.0
+ResNet50,4,0.6,0.0,0.0,0.0
+ResNet50,5,0.6,0.0,0.0,0.0

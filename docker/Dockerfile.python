@@ -1,0 +1,31 @@
+# Base image with micromamba
+FROM mambaorg/micromamba:1.5.8
+
+USER root
+
+# Install system dependencies including fuse, wget, unzip
+RUN apt-get update && apt-get install -y \
+    git build-essential libgl1 unzip fuse3 wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install rclone inside the container
+RUN wget -qO /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip && \
+    cd /tmp && unzip rclone.zip && \
+    cd rclone-*-linux-amd64 && \
+    install -m 0755 rclone /usr/local/bin/ && \
+    rm -rf /tmp/rclone*
+
+# Set working directory
+WORKDIR /workspace
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt /workspace/requirements.txt
+RUN micromamba install -y -n base -c conda-forge python=3.11 && \
+    micromamba run -n base pip install --no-cache-dir -r /workspace/requirements.txt && \
+    micromamba clean --all -y
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg \
+    PATH=/opt/conda/bin:$PATH

@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  python:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    container_name: mmp-python
+    env_file: .env
+    volumes:
+      - ./data:/workspace/data
+      - ./src/python:/workspace/src/python
+      - ./src/r:/workspace/src/r
+      - ./requirements.txt:/workspace/requirements.txt
+      - ./scripts:/workspace/scripts:ro
+      - ./secrets:/workspace/secrets:ro
+      - ./tabular_models:/workspace/tabular_models
+      - ./image_models:/workspace/image_models
+      - ./multimodal_results:/workspace/multimodal_results
+      - ./surrogates:/workspace/surrogates
+      - ./comparison_xai:/workspace/comparison_xai
+      - ./xai_fuzzy_model:/workspace/xai_fuzzy_model
+
+    working_dir: /workspace
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    command: ["bash", "-lc", "sleep infinity"]
+
+  r:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.r
+    container_name: mmp-r
+    env_file: .env
+    volumes:
+      - ./data:/workspace/data
+      - ./src/r:/workspace/src/r
+      - ./surrogates:/workspace/surrogates
+    working_dir: /workspace
+    command: ["bash", "-lc", "sleep infinity"]
