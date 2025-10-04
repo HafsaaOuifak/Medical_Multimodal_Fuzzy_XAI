@@ -170,6 +170,4 @@ docker compose up --build -d
   docker exec -it mmp-python bash
   ```
 
----
 
-⭐ **Pro tip:** You can edit this README in VS Code and use “Open Preview” to see exactly how it looks on GitHub.
