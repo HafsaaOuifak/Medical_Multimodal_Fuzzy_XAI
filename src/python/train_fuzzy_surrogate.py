@@ -1,81 +1,136 @@
-import argparse
-import os
-import subprocess
-import sys
-import time
-import pandas as pd
 import numpy as np
+import pandas as pd
+from skimage import color, filters, measure
 
-def select_top_k_features(csv_path: str, out_dir: str, top_k: int) -> str:
+def _to_float01(img):
+    arr = np.asarray(img, dtype=np.float32)
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr
+
+def extract_image_features(img_rgb01):
     """
-    Load surrogate CSV, select top_k features by mutual information with 'class',
-    save a reduced CSV (keeping 'class'), and return its path.
+    img_rgb01: np.ndarray in [0,1], shape (H,W,3) or (H,W)
+    Returns 9 semantic features:
+      brightness, contrast, edge_density, entropy,
+      sharpness(laplacian var), intensity_mean, intensity_std, intensity_skew, intensity_kurtosis
     """
-    from sklearn.feature_selection import mutual_info_classif
+    from scipy.stats import kurtosis, skew
+    import cv2
 
-    df = pd.read_csv(csv_path)
-    if "class" not in df.columns:
-        raise ValueError("Surrogate CSV must contain a 'class' column.")
-    if top_k <= 0 or top_k >= (df.shape[1] - 1):
-        # no selection or trivial -> return original
-        return csv_path
+    # ensure grayscale [0,1]
+    if img_rgb01.ndim == 3 and img_rgb01.shape[-1] == 3:
+        gray = color.rgb2gray(img_rgb01).astype(np.float32)
+    elif img_rgb01.ndim == 2:
+        gray = img_rgb01.astype(np.float32)
+    else:
+        raise ValueError("Unexpected image shape for feature extraction")
 
-    X = df.drop(columns=["class"])
-    y = df["class"].astype(int).values
+    brightness = float(np.mean(gray))
+    contrast   = float(np.std(gray))
+    edge_density = float(np.mean(filters.sobel(gray)))
+    entropy = float(measure.shannon_entropy(gray))
 
-    # compute MI (handle constant columns robustly)
-    X_num = X.apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(np.float32)
-    try:
-        mi = mutual_info_classif(X_num, y, random_state=42)
-    except Exception:
-        # fallback: variance ranking if MI fails
-        mi = X_num.var(axis=0)
+    gray_u8 = np.clip(gray * 255.0, 0, 255).astype(np.uint8)
+    lap = cv2.Laplacian(gray_u8, cv2.CV_64F)
+    sharpness = float(lap.var())
 
-    # top-k indices
-    idx_sorted = np.argsort(mi)[::-1]
-    keep_idx = idx_sorted[:top_k]
-    keep_cols = list(X.columns[keep_idx])
+    hist = gray.ravel()
+    intensity_mean     = float(np.mean(hist))
+    intensity_std      = float(np.std(hist))
+    intensity_skew     = float(skew(hist))
+    intensity_kurtosis = float(kurtosis(hist))
 
-    reduced = pd.concat([X[keep_cols], df["class"]], axis=1)
-    out_csv = os.path.join(out_dir, "surrogate_dataset_selected.csv")
-    reduced.to_csv(out_csv, index=False)
+    feats = np.array([
+        brightness, contrast, edge_density, entropy,
+        sharpness, intensity_mean, intensity_std,
+        intensity_skew, intensity_kurtosis
+    ], dtype=np.float32)
 
-    # Save which columns were selected
-    pd.DataFrame({"Selected_Feature": keep_cols}).to_csv(
-        os.path.join(out_dir, "selected_features.csv"), index=False
-    )
+    return feats
 
-    return out_csv
+def _label_with_blackbox(multimodal_model, feat_vec_1d):
+    """Expect multimodal_model.predict_proba on combined features -> probability of class 1."""
+    proba = multimodal_model.predict_proba(feat_vec_1d.reshape(1, -1))
+    # Binary model: take column 1; fallback to last column
+    if proba.ndim == 2 and proba.shape[1] >= 2:
+        p1 = float(proba[0, 1])
+    else:
+        p1 = float(proba.ravel()[-1])
+    return 1 if p1 > 0.5 else 0, p1
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", required=True, help="Path to surrogate_dataset.csv")
-    parser.add_argument("--run_dir", required=True, help="Output directory for FRBS results")
-    parser.add_argument("--top_k", type=int, default=0, help="Use only top-K features by MI (0 = use all)")
-    args = parser.parse_args()
+def generate_surrogates(x_tab0, x_img0, multimodal_model, n=200, tab_noise=0.05, img_noise=0.01, seed=42,
+                        max_tries=5, noise_growth=2.0):
+    """
+    Create local surrogate dataset around one (tabular, image) point.
+    Auto-retries with stronger noise until both classes 0/1 are present.
+    Returns: DataFrame with named columns + final 'class' (0/1)
+    """
+    rng = np.random.default_rng(seed)
 
-    os.makedirs(args.run_dir, exist_ok=True)
+    # Tabular base (1,row) → flat vector + names
+    tab_base = x_tab0.values.flatten().astype(np.float32)
+    tab_names = list(x_tab0.columns)
 
-    # If requested, reduce features first
-    csv_for_r = args.csv
-    if args.top_k and args.top_k > 0:
-        csv_for_r = select_top_k_features(args.csv, args.run_dir, args.top_k)
+    # Prepare image base -> [0,1] RGB
+    img_base = _to_float01(x_img0)
+    if img_base.ndim == 2:
+        img_base = np.stack([img_base, img_base, img_base], axis=-1)
+    elif img_base.ndim == 3 and img_base.shape[-1] == 1:
+        img_base = np.repeat(img_base, 3, axis=-1)
+    elif img_base.ndim == 3 and img_base.shape[-1] == 3:
+        pass
+    else:
+        raise ValueError("x_img0 must be (H,W) or (H,W,1) or (H,W,3)")
 
-    start = time.perf_counter()
-    # Call R script
-    cmd = [
-        "Rscript",
-        "/workspace/src/r/train_fuzzy_surrogate.R",
-        "--csv", csv_for_r,
-        "--outdir", args.run_dir
+    img_feat_names = [
+        "img_brightness", "img_contrast", "img_edge_density", "img_entropy",
+        "img_sharpness", "img_intensity_mean", "img_intensity_std",
+        "img_intensity_skew", "img_intensity_kurtosis"
     ]
-    subprocess.check_call(cmd)
-    runtime = time.perf_counter() - start
 
-    with open(os.path.join(args.run_dir, "frbs_time.txt"), "w") as f:
-        f.write(str(runtime))
+    rows, labels = [], []
 
-    print(f"✅ FRBS surrogate completed in {runtime:.3f}s. Outputs in {args.run_dir}")
+    t_noise = float(tab_noise)
+    i_noise = float(img_noise)
 
-if __name__ == "__main__":
-    main()
+    for attempt in range(1, max_tries + 1):
+        rows.clear(); labels.clear()
+
+        for _ in range(int(n)):
+            # perturb tabular
+            tab_surr = tab_base + rng.normal(0.0, t_noise, size=tab_base.shape).astype(np.float32)
+
+            # perturb image (pixelwise noise)
+            img_noise_mat = rng.normal(0.0, i_noise, size=img_base.shape).astype(np.float32)
+            img_surr = np.clip(img_base + img_noise_mat, 0.0, 1.0)
+
+            # image semantic features
+            img_feats = extract_image_features(img_surr).astype(np.float32)
+
+            # combine: [img_feats | tab_feats]
+            feat_vec = np.concatenate([img_feats, tab_surr], axis=0).astype(np.float32)
+
+            y, _ = _label_with_blackbox(multimodal_model, feat_vec)
+            rows.append(feat_vec)
+            labels.append(y)
+
+        # check class balance
+        uniq = set(labels)
+        if len(uniq) >= 2:
+            break  # good: both classes present
+        # else, grow noise and try again
+        t_noise *= noise_growth
+        i_noise *= noise_growth
+
+    if len(set(labels)) < 2:
+        raise RuntimeError(
+            "Surrogate generation produced a single class after retries. "
+            f"Try increasing --n or base noise (tab_noise/img_noise)."
+        )
+
+    all_names = img_feat_names + tab_names
+    df = pd.DataFrame(rows, columns=all_names)
+    df["class"] = labels
+    return df

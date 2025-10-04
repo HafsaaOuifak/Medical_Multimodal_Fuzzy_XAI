@@ -1,31 +1,60 @@
-# Base image with micromamba
+# Base image with micromamba (same as before)
 FROM mambaorg/micromamba:1.5.8
 
 USER root
 
-# Install system dependencies including fuse, wget, unzip
-RUN apt-get update && apt-get install -y \
-    git build-essential libgl1 unzip fuse3 wget ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# --- System dependencies ---
+# - r-base + build libs for installing CRAN packages (frbs, optparse)
+# - OpenCV runtime bits (headless OK via pip package)
+# - fuse3 + wget + unzip for rclone + your mount script
+# - libgl1 for some image libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential ca-certificates curl wget unzip \
+    fuse3 libgl1 \
+    r-base r-base-dev libcurl4-openssl-dev libssl-dev libxml2-dev \
+    libxt6 libxrender1 libxext6 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install rclone inside the container
+# --- rclone (for Google Drive mount) ---
 RUN wget -qO /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip && \
     cd /tmp && unzip rclone.zip && \
     cd rclone-*-linux-amd64 && \
     install -m 0755 rclone /usr/local/bin/ && \
     rm -rf /tmp/rclone*
 
-# Set working directory
+# Working directory
 WORKDIR /workspace
 
-# Copy requirements and install Python dependencies
+# --- Python setup with micromamba ---
+# Keep your Python 3.11 + requirements install (pip in base env)
 COPY requirements.txt /workspace/requirements.txt
 RUN micromamba install -y -n base -c conda-forge python=3.11 && \
     micromamba run -n base pip install --no-cache-dir -r /workspace/requirements.txt && \
     micromamba clean --all -y
 
-# Set environment variables
+# Extra Python deps needed by your explainer & image features
+# (opencv headless avoids GUI deps; lime/shap for XAI; scikit-image for feature extraction)
+RUN micromamba run -n base pip install --no-cache-dir \
+      opencv-python-headless \
+      lime \
+      shap \
+      scikit-image
+
+# --- R packages for the fuzzy explainer ---
+# Install CRAN packages (frbs, optparse) into the system R
+RUN Rscript -e "install.packages(c('frbs','optparse'), repos='https://cloud.r-project.org')"
+
+# (Optional) Make sure your project code/scripts exist in the image
+# If you prefer bind-mounting code at runtime, you can skip these COPY lines.
+# COPY src /workspace/src
+# COPY scripts /workspace/scripts
+# RUN chmod -R a+rx /workspace/scripts
+
+# Environment
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     MPLBACKEND=Agg \
     PATH=/opt/conda/bin:$PATH
+
+# Default command
+CMD ["bash"]
